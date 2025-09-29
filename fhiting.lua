@@ -840,6 +840,75 @@ local Cross={
     PulseSpeed=2.5,
 }
 
+local function newWeakPartSet()
+    return setmetatable({}, {__mode = "k"})
+end
+
+local NoClipState = {
+    enabled = false,
+    connection = nil,
+    characterConn = nil,
+    changed = newWeakPartSet(),
+}
+
+local function disablePartCollision(part)
+    if part and part:IsA("BasePart") and part.CanCollide then
+        NoClipState.changed[part] = true
+        part.CanCollide = false
+    end
+end
+
+local function enforceNoClip()
+    local character = LocalPlayer.Character
+    if not character then return end
+    for _, descendant in ipairs(character:GetDescendants()) do
+        disablePartCollision(descendant)
+    end
+end
+
+local function setNoClipEnabled(enabled)
+    enabled = enabled == true
+    if enabled == NoClipState.enabled then
+        return
+    end
+
+    NoClipState.enabled = enabled
+
+    if enabled then
+        NoClipState.changed = newWeakPartSet()
+        enforceNoClip()
+
+        if NoClipState.connection then
+            NoClipState.connection:Disconnect()
+        end
+        NoClipState.connection = RunService.Stepped:Connect(enforceNoClip)
+
+        if NoClipState.characterConn then
+            NoClipState.characterConn:Disconnect()
+        end
+        NoClipState.characterConn = LocalPlayer.CharacterAdded:Connect(function()
+            NoClipState.changed = newWeakPartSet()
+            task.defer(enforceNoClip)
+        end)
+    else
+        if NoClipState.connection then
+            NoClipState.connection:Disconnect()
+            NoClipState.connection = nil
+        end
+        if NoClipState.characterConn then
+            NoClipState.characterConn:Disconnect()
+            NoClipState.characterConn = nil
+        end
+
+        for part in pairs(NoClipState.changed) do
+            if part and part.Parent and part:IsA("BasePart") then
+                part.CanCollide = true
+            end
+        end
+        NoClipState.changed = newWeakPartSet()
+    end
+end
+
 --==================== RUNTIME / DRAW ====================--
 -- FOV ring
 local AA_GUI=Instance.new("ScreenGui"); AA_GUI.Name="PC_FOV"; AA_GUI.IgnoreGuiInset=true; AA_GUI.ResetOnSpawn=false; AA_GUI.DisplayOrder=45; AA_GUI.Parent=safeParent()
@@ -1280,6 +1349,9 @@ local dragToggle = mkToggle(MiscP,"Allow Dragging", true, function(v)
     draggingEnabled = v
     if not v then dragging=false end
 end, "Enables dragging the window around the screen.")
+local noclipToggle = mkToggle(MiscP,"NoClip", NoClipState.enabled, function(v)
+    setNoClipEnabled(v)
+end, "Disables collisions on your character so you can move through geometry.")
 local centerBtn = mkButton(MiscP, "Center Panel", function()
     Root.Position = UDim2.fromScale(0.5,0.5)
     dragging = false
@@ -1386,6 +1458,11 @@ local function killMenu()
     -- disable features so runtime loops render nothing
     AA.Enabled=false; ESP.Enabled=false; Cross.Enabled=false; updCross()
     stickyTarget=nil; stickyTimer=0
+    if noclipToggle then
+        noclipToggle.Set(false)
+    else
+        setNoClipEnabled(false)
+    end
     -- clean existing highlights
     for _,pl in ipairs(Players:GetPlayers()) do
         local ch = pl.Character
