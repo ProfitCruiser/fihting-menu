@@ -8,6 +8,7 @@
 local TweenService      = game:GetService("TweenService")
 local UserInputService  = game:GetService("UserInputService")
 local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Lighting          = game:GetService("Lighting")
 local Players           = game:GetService("Players")
 local GuiService        = game:GetService("GuiService")
@@ -771,6 +772,440 @@ local Cross={
     PulseSpeed=2.5,
 }
 
+--==================== RESTAURANT AUTO FARM ====================--
+local AutoFarm = {
+    Enabled = false,
+    ScanInterval = 1,
+    MaxOrders = 8,
+    Remotes = nil,
+    Modules = {},
+    CustomerOrders = {},
+    ActiveOrderCount = 0,
+    Thread = nil,
+    Status = "AutoFarm idle. Toggle to begin.",
+    LastIdleStatus = 0,
+    LastMenu = nil,
+    FoodConsumedConnection = nil,
+    ToggleControl = nil,
+    Syncing = false,
+}
+
+local AutoFarmStatusLabel
+
+local function setFarmStatus(text)
+    local msg = trim(text or "")
+    if msg == "" then
+        msg = "AutoFarm idle."
+    end
+    if AutoFarm.Status ~= msg then
+        AutoFarm.Status = msg
+        if AutoFarmStatusLabel then
+            AutoFarmStatusLabel.Text = msg
+        end
+        print("[Aurora][AutoFarm] " .. msg)
+    end
+end
+
+local function callRemote(remote, ...)
+    if not remote or not remote.IsA then
+        return false, "missing remote"
+    end
+    if remote:IsA("RemoteFunction") then
+        local ok, res = pcall(function()
+            return remote:InvokeServer(...)
+        end)
+        return ok, res
+    end
+    if remote:IsA("RemoteEvent") then
+        local ok, err = pcall(function()
+            remote:FireServer(...)
+        end)
+        return ok, err
+    end
+    return false, "unsupported remote type"
+end
+
+local function fetchRestaurantRemotes()
+    local events = ReplicatedStorage:FindFirstChild("Events")
+    if not events then
+        return nil, "ReplicatedStorage.Events folder not found"
+    end
+
+    local restaurantFolder = events:FindFirstChild("Restaurant")
+    local foodFolder = events:FindFirstChild("Food")
+    local cookFolder = events:FindFirstChild("Cook")
+
+    if not restaurantFolder or not foodFolder then
+        return nil, "Restaurant or Food remote folders missing"
+    end
+
+    local remotes = {
+        GetMenu = restaurantFolder:FindFirstChild("FoodMenu") and restaurantFolder.FoodMenu:FindFirstChild("GetMenu"),
+        FoodOrdered = foodFolder:FindFirstChild("FoodOrdered"),
+        GrabFood = restaurantFolder:FindFirstChild("GrabFood"),
+        CookInputRequested = cookFolder and cookFolder:FindFirstChild("CookInputRequested") or nil,
+        CookUpdated = cookFolder and cookFolder:FindFirstChild("CookUpdated") or nil,
+        FoodConsumed = foodFolder:FindFirstChild("FoodConsumed"),
+        PurchaseIngredientRequested = foodFolder:FindFirstChild("PurchaseIngredientRequested"),
+    }
+
+    if not remotes.GetMenu or not remotes.FoodOrdered then
+        return nil, "Required Restaurant Tycoon 3 remotes are missing"
+    end
+
+    return remotes
+end
+
+local function loadRestaurantModules()
+    local modules = {}
+    local source = ReplicatedStorage:FindFirstChild("Source")
+    if not source then
+        return modules
+    end
+
+    local util = source:FindFirstChild("Utility")
+    if not util then
+        return modules
+    end
+
+    local function tryLoad(childName, key)
+        local module = util:FindFirstChild(childName)
+        if module and module:IsA("ModuleScript") then
+            local ok, lib = pcall(require, module)
+            if ok then
+                modules[key] = lib
+            end
+        end
+    end
+
+    tryLoad("Food", "FoodUtility")
+    tryLoad("Cook", "CookUtility")
+    tryLoad("Furniture", "FurnitureUtility")
+
+    return modules
+end
+
+local function getCustomerFolder()
+    local source = ReplicatedStorage:FindFirstChild("Source")
+    if not source then return nil end
+    local data = source:FindFirstChild("Data")
+    if not data then return nil end
+    local restaurant = data:FindFirstChild("Restaurant")
+    if not restaurant then return nil end
+    return restaurant:FindFirstChild("CustomerList") or restaurant:FindFirstChild("Customers")
+end
+
+local function scanForWaitingCustomers()
+    local customers = {}
+    local folder = getCustomerFolder()
+    if not folder then
+        return customers
+    end
+
+    for _, customer in ipairs(folder:GetChildren()) do
+        local isWaiting = false
+        local stateValue = customer:FindFirstChild("State")
+        if stateValue and stateValue:IsA("StringValue") then
+            isWaiting = stateValue.Value == "Waiting"
+        end
+        local waitingValue = customer:FindFirstChild("Waiting")
+        if waitingValue and waitingValue:IsA("BoolValue") then
+            isWaiting = waitingValue.Value or isWaiting
+        end
+        if isWaiting then
+            table.insert(customers, customer)
+        end
+    end
+
+    return customers
+end
+
+local function getMenu()
+    if not AutoFarm.Remotes or not AutoFarm.Remotes.GetMenu then
+        return nil, "GetMenu remote missing"
+    end
+
+    local now = os.clock()
+    if AutoFarm.LastMenu and (now - (AutoFarm.LastMenu.timestamp or 0)) < 5 then
+        return AutoFarm.LastMenu.data
+    end
+
+    local success, menu = callRemote(AutoFarm.Remotes.GetMenu)
+    if not success then
+        return nil, tostring(menu)
+    end
+    if type(menu) == "table" then
+        AutoFarm.LastMenu = {data = menu, timestamp = now}
+    end
+    return menu
+end
+
+local function selectDish(menu)
+    if type(menu) ~= "table" then
+        return nil
+    end
+    if menu[1] ~= nil then
+        return menu[1]
+    end
+    for _, item in pairs(menu) do
+        return item
+    end
+    return nil
+end
+
+local function orderForCustomer(customer)
+    local menu, err = getMenu()
+    if not menu then
+        return false, nil, err
+    end
+
+    local dish = selectDish(menu)
+    if not dish then
+        return false, nil, "No dishes available"
+    end
+
+    local ok, orderErr = callRemote(AutoFarm.Remotes.FoodOrdered, customer, dish)
+    if not ok then
+        return false, nil, tostring(orderErr)
+    end
+
+    return true, {
+        id = HttpService:GenerateGUID(false),
+        customer = customer,
+        dish = dish,
+        orderedAt = os.time(),
+    }
+end
+
+local function processCooking(order)
+    if not AutoFarm.Enabled then
+        return
+    end
+
+    local cookUtil = AutoFarm.Modules.CookUtility
+    if cookUtil then
+        if cookUtil.StartCook then
+            pcall(cookUtil.StartCook, order)
+        end
+        if cookUtil.FinishCook then
+            pcall(cookUtil.FinishCook, order)
+            return
+        end
+    end
+
+    local remotes = AutoFarm.Remotes
+    if remotes then
+        if remotes.CookInputRequested then
+            callRemote(remotes.CookInputRequested, order.customer, {complete = true, dish = order.dish})
+        end
+        if remotes.CookUpdated then
+            callRemote(remotes.CookUpdated, order.customer, {status = "Completed", dish = order.dish})
+        end
+    end
+end
+
+local function pickupAndServe(order)
+    if not AutoFarm.Enabled then
+        return
+    end
+
+    local remotes = AutoFarm.Remotes
+    if remotes and remotes.GrabFood then
+        callRemote(remotes.GrabFood, order.customer, order.dish)
+    end
+
+    local furnitureUtil = AutoFarm.Modules.FurnitureUtility
+    if furnitureUtil and furnitureUtil.PlaceFoodOnTable then
+        pcall(furnitureUtil.PlaceFoodOnTable, order)
+    end
+
+    local foodUtil = AutoFarm.Modules.FoodUtility
+    if foodUtil and foodUtil.ServeCustomer then
+        pcall(foodUtil.ServeCustomer, order.customer, order.dish)
+    end
+end
+
+local function clearFoodConsumedConnection()
+    if AutoFarm.FoodConsumedConnection then
+        AutoFarm.FoodConsumedConnection:Disconnect()
+        AutoFarm.FoodConsumedConnection = nil
+    end
+end
+
+local function bindFoodConsumed()
+    clearFoodConsumedConnection()
+    local remote = AutoFarm.Remotes and AutoFarm.Remotes.FoodConsumed
+    if remote and remote:IsA("RemoteEvent") then
+        AutoFarm.FoodConsumedConnection = remote.OnClientEvent:Connect(function()
+            if AutoFarm.Enabled then
+                setFarmStatus("Guests finished eating. Awaiting new customers…")
+            end
+        end)
+    end
+end
+
+local function releaseOrder(customer)
+    if AutoFarm.CustomerOrders[customer] then
+        AutoFarm.CustomerOrders[customer] = nil
+        AutoFarm.ActiveOrderCount = math.max(0, AutoFarm.ActiveOrderCount - 1)
+    end
+end
+
+local function autoFarmStep(currentThread)
+    if not AutoFarm.Enabled or AutoFarm.Thread ~= currentThread then
+        return
+    end
+
+    if not AutoFarm.Remotes then
+        local remotes, err = fetchRestaurantRemotes()
+        if not remotes then
+            setFarmStatus("Waiting for Restaurant remotes: " .. (err or "unknown error"))
+            task.wait(3)
+            return
+        end
+        AutoFarm.Remotes = remotes
+        bindFoodConsumed()
+        setFarmStatus("Restaurant remotes located. Waiting for customers…")
+    end
+
+    local waitingCustomers = scanForWaitingCustomers()
+    if #waitingCustomers == 0 then
+        local now = os.clock()
+        if now - (AutoFarm.LastIdleStatus or 0) > 5 then
+            setFarmStatus("Idle – no waiting customers.")
+            AutoFarm.LastIdleStatus = now
+        end
+        return
+    end
+
+    for _, customer in ipairs(waitingCustomers) do
+        if not AutoFarm.Enabled or AutoFarm.Thread ~= currentThread then
+            return
+        end
+
+        if AutoFarm.CustomerOrders[customer] then
+            -- already handling this customer
+        else
+            if AutoFarm.ActiveOrderCount >= AutoFarm.MaxOrders then
+                break
+            end
+
+            local ok, order, err = orderForCustomer(customer)
+            if not ok or not order then
+                setFarmStatus(string.format("Failed to order for %s: %s",
+                    customer.Name or customer:GetFullName(),
+                    err or "unknown error"))
+            else
+                AutoFarm.CustomerOrders[customer] = order
+                AutoFarm.ActiveOrderCount += 1
+                setFarmStatus(string.format("Order placed for %s.", customer.Name or customer:GetFullName()))
+
+                task.spawn(function()
+                    processCooking(order)
+                    if AutoFarm.Enabled then
+                        pickupAndServe(order)
+                        if AutoFarm.Enabled then
+                            setFarmStatus(string.format("Served %s.", customer.Name or customer:GetFullName()))
+                        end
+                    end
+                    releaseOrder(customer)
+                end)
+            end
+        end
+    end
+end
+
+local function autoFarmLoop()
+    local thread = coroutine.running()
+    AutoFarm.Thread = thread
+    while AutoFarm.Enabled and AutoFarm.Thread == thread do
+        autoFarmStep(thread)
+        local interval = math.max(0.2, AutoFarm.ScanInterval or 1)
+        task.wait(interval)
+    end
+    if AutoFarm.Thread == thread then
+        AutoFarm.Thread = nil
+    end
+end
+
+local function syncToggleState()
+    local control = AutoFarm.ToggleControl
+    if not control or not control.Get or not control.Set then
+        return
+    end
+    local desired = AutoFarm.Enabled
+    if control.Get() ~= desired then
+        AutoFarm.Syncing = true
+        control.Set(desired)
+        AutoFarm.Syncing = false
+    end
+end
+
+local function startAutoFarm()
+    if AutoFarm.Thread then
+        return
+    end
+    task.spawn(autoFarmLoop)
+end
+
+local function stopAutoFarm()
+    AutoFarm.Enabled = false
+    AutoFarm.Remotes = nil
+    AutoFarm.Modules = {}
+    AutoFarm.CustomerOrders = {}
+    AutoFarm.ActiveOrderCount = 0
+    AutoFarm.LastMenu = nil
+    clearFoodConsumedConnection()
+end
+
+local function autofarm(state)
+    if state == nil then
+        state = not AutoFarm.Enabled
+    end
+
+    if state then
+        if AutoFarm.Enabled then
+            syncToggleState()
+            return true, "AutoFarm already enabled"
+        end
+
+        local remotes, err = fetchRestaurantRemotes()
+        if not remotes then
+            setFarmStatus("Cannot start AutoFarm: " .. (err or "missing remotes"))
+            syncToggleState()
+            return false, err or "missing remotes"
+        end
+
+        AutoFarm.Remotes = remotes
+        AutoFarm.Modules = loadRestaurantModules()
+        AutoFarm.CustomerOrders = {}
+        AutoFarm.ActiveOrderCount = 0
+        AutoFarm.LastMenu = nil
+        AutoFarm.Enabled = true
+        bindFoodConsumed()
+        setFarmStatus("AutoFarm enabled. Waiting for customers…")
+        startAutoFarm()
+        syncToggleState()
+        return true, "AutoFarm enabled"
+    end
+
+    stopAutoFarm()
+    setFarmStatus("AutoFarm disabled.")
+    syncToggleState()
+    return true, "AutoFarm disabled"
+end
+
+do
+    local ok, env = pcall(function()
+        return getgenv and getgenv()
+    end)
+    if ok and type(env) == "table" then
+        env.autofarm = autofarm
+    else
+        _G.autofarm = autofarm
+    end
+end
+
 --==================== RUNTIME / DRAW ====================--
 -- FOV ring
 local AA_GUI=Instance.new("ScreenGui"); AA_GUI.Name="PC_FOV"; AA_GUI.IgnoreGuiInset=true; AA_GUI.ResetOnSpawn=false; AA_GUI.DisplayOrder=45; AA_GUI.Parent=safeParent()
@@ -1070,11 +1505,12 @@ RunService.RenderStepped:Connect(function() for _,pl in ipairs(Players:GetPlayer
 Players.PlayerAdded:Connect(function(p) p.CharacterAdded:Connect(function() task.wait(0.2); espTick(p) end) end)
 
 --==================== PAGES & CONTROLS ====================--
-local AimbotP = newPage("Aimbot")
-local ESPP    = newPage("ESP")
-local VisualP = newPage("Visuals")
-local MiscP   = newPage("Misc")
-local ConfP   = newPage("Config")
+local AimbotP     = newPage("Aimbot")
+local ESPP        = newPage("ESP")
+local VisualP     = newPage("Visuals")
+local RestaurantP = newPage("Restaurant")
+local MiscP       = newPage("Misc")
+local ConfP       = newPage("Config")
 
 local ESPColorPresets = {
     {label = "Crimson Pulse", value = Color3.fromRGB(255, 70, 70)},
@@ -1091,10 +1527,61 @@ local ESPColorPresets = {
 tabButton("Aimbot", AimbotP)
 tabButton("ESP", ESPP)
 tabButton("Visuals", VisualP)
+tabButton("Restaurant", RestaurantP)
 tabButton("Misc", MiscP)
 tabButton("Config", ConfP)
 -- make Aimbot page visible by default
 AimbotP.Visible = true
+
+-- Restaurant Tycoon 3 AutoFarm controls
+local farmToggle
+do
+    local statusRow, statusLabel = rowBase(RestaurantP, "Status", "Shows the most recent Restaurant Tycoon 3 AutoFarm update.")
+    statusLabel.TextYAlignment = Enum.TextYAlignment.Top
+    statusLabel.Text = "Status"
+
+    local statusValue = Instance.new("TextLabel", statusRow)
+    statusValue.Name = "StatusValue"
+    statusValue.BackgroundTransparency = 1
+    statusValue.Position = UDim2.new(0, 18, 0, 32)
+    statusValue.Size = UDim2.new(1, -36, 0, 24)
+    statusValue.Font = Enum.Font.Gotham
+    statusValue.TextSize = 12
+    statusValue.TextColor3 = T.Subtle
+    statusValue.TextWrapped = true
+    statusValue.TextXAlignment = Enum.TextXAlignment.Left
+    statusValue.TextYAlignment = Enum.TextYAlignment.Top
+    statusValue.Text = AutoFarm.Status
+
+    AutoFarmStatusLabel = statusValue
+
+    farmToggle = mkToggle(RestaurantP, "AutoFarm (Restaurant Tycoon 3)", AutoFarm.Enabled, function(v)
+        if AutoFarm.Syncing then
+            return
+        end
+
+        if v then
+            if not AutoFarm.Enabled then
+                local ok, err = autofarm(true)
+                if not ok then
+                    AutoFarm.Syncing = true
+                    if farmToggle and farmToggle.Set then
+                        farmToggle.Set(false)
+                    end
+                    AutoFarm.Syncing = false
+                    if err then
+                        setFarmStatus("Failed to enable AutoFarm: " .. tostring(err))
+                    end
+                end
+            end
+        else
+            if AutoFarm.Enabled then
+                autofarm(false)
+            end
+        end
+    end, "Automatically orders, cooks, and serves guests in Restaurant Tycoon 3.")
+end
+AutoFarm.ToggleControl = farmToggle
 
 -- Aimbot block
 mkToggle(AimbotP,"Enable Aimbot", AA.Enabled, function(v) AA.Enabled=v end, "Turns the aimbot feature on or off.")
