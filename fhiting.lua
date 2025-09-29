@@ -16,6 +16,12 @@ local TextService       = game:GetService("TextService")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera      = workspace.CurrentCamera
+local Mouse do
+    local ok, value = pcall(function()
+        return LocalPlayer:GetMouse()
+    end)
+    Mouse = ok and value or nil
+end
 
 -- forward-declare Root so click handlers can access it before it's created
 local Root
@@ -723,6 +729,7 @@ local AA={
     Strength=0.15,
     PartName="Head",
     ShowFOV=false,
+    SilentAim=false,
     FOVRadiusPx=180,
     MaxDistance=250,
     MinDistance=0,
@@ -741,6 +748,68 @@ local AA={
     ReactionJitter=0,
     VerticalOffset=0,
 }
+
+local SilentAimState = {
+    point = nil,
+    part = nil,
+}
+
+local unpack = table.unpack or unpack
+
+if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" and typeof(checkcaller) == "function" and Mouse then
+    local oldIndex
+    oldIndex = hookmetamethod(game, "__index", function(self, key)
+        if not checkcaller() and AA.SilentAim and SilentAimState.point then
+            if self == Mouse then
+                if key == "Hit" then
+                    local originCF = Mouse.Origin or Camera.CFrame
+                    return CFrame.new(originCF.Position, SilentAimState.point)
+                elseif key == "Target" then
+                    return SilentAimState.part or oldIndex(self, key)
+                end
+            end
+        end
+        return oldIndex(self, key)
+    end)
+
+    local oldNamecall
+    oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+        local method = getnamecallmethod()
+        local args = {...}
+        if not checkcaller() and AA.SilentAim and SilentAimState.point then
+            if method == "Raycast" and self == workspace then
+                local origin, direction = args[1], args[2]
+                if typeof(origin) == "Vector3" and typeof(direction) == "Vector3" then
+                    local newDir = SilentAimState.point - origin
+                    if newDir.Magnitude > 0 then
+                        local magnitude = direction.Magnitude
+                        if magnitude > 0 then
+                            args[2] = newDir.Unit * magnitude
+                        else
+                            args[2] = newDir
+                        end
+                        return oldNamecall(self, unpack(args))
+                    end
+                end
+            elseif method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" or method == "FindPartOnRay" then
+                local ray = args[1]
+                if typeof(ray) == "Ray" then
+                    local origin = ray.Origin
+                    local desired = SilentAimState.point - origin
+                    local magnitude = ray.Direction.Magnitude
+                    if desired.Magnitude > 0 then
+                        if magnitude <= 0 then
+                            magnitude = desired.Magnitude
+                        end
+                        args[1] = Ray.new(origin, desired.Unit * magnitude)
+                        return oldNamecall(self, unpack(args))
+                    end
+                end
+            end
+        end
+        return oldNamecall(self, ...)
+    end)
+end
 local ESP={
     Enabled=false,
     EnemiesOnly=false,
@@ -934,11 +1003,15 @@ end
 
 -- Main render
 RunService.RenderStepped:Connect(function(dt)
+    SilentAimState.point = nil
+    SilentAimState.part = nil
+
     local fovRadius = math.max(0, AA.FOVRadiusPx or 0)
-    FOV.Visible = (AA.Enabled and AA.ShowFOV)
+    local aimFeatureEnabled = (AA.Enabled or AA.SilentAim)
+    FOV.Visible = (aimFeatureEnabled and AA.ShowFOV)
     FOV.Size    = UDim2.fromOffset(fovRadius*2, fovRadius*2)
 
-    local aiming = AA.Enabled and (not AA.RequireRMB or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2))
+    local aiming = aimFeatureEnabled and (not AA.RequireRMB or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2))
     if aiming then
         local candidate = getTarget()
         if AA.StickyAim then
@@ -998,15 +1071,22 @@ RunService.RenderStepped:Connect(function(dt)
                     alpha = math.clamp(alpha + normalized * AA.CloseRangeBoost, 0, 1)
                 end
 
-                local deadzone = math.max(0, AA.Deadzone or 0)
-                if deadzone > 0 then
-                    local closeness = (targetInfo.pixelDist - deadzone) / math.max(deadzone, 1)
-                    if closeness > 0 then
-                        local scale = math.clamp(closeness, 0.05, 1)
-                        Camera.CFrame = Camera.CFrame:Lerp(des, math.clamp(alpha * scale, 0, 1))
+                if AA.SilentAim then
+                    SilentAimState.point = targetPos
+                    SilentAimState.part = validateTarget(targetInfo) and targetInfo.part or nil
+                end
+
+                if AA.Enabled then
+                    local deadzone = math.max(0, AA.Deadzone or 0)
+                    if deadzone > 0 then
+                        local closeness = (targetInfo.pixelDist - deadzone) / math.max(deadzone, 1)
+                        if closeness > 0 then
+                            local scale = math.clamp(closeness, 0.05, 1)
+                            Camera.CFrame = Camera.CFrame:Lerp(des, math.clamp(alpha * scale, 0, 1))
+                        end
+                    else
+                        Camera.CFrame = Camera.CFrame:Lerp(des, alpha)
                     end
-                else
-                    Camera.CFrame = Camera.CFrame:Lerp(des, alpha)
                 end
             end
         else
@@ -1098,6 +1178,7 @@ AimbotP.Visible = true
 
 -- Aimbot block
 mkToggle(AimbotP,"Enable Aimbot", AA.Enabled, function(v) AA.Enabled=v end, "Turns the aimbot feature on or off.")
+mkToggle(AimbotP,"Silent Aim (no camera move)", AA.SilentAim, function(v) AA.SilentAim=v end, "Adjusts hit-scan rays to your target without shifting the camera.")
 mkToggle(AimbotP,"Require Right Mouse (hold)", AA.RequireRMB, function(v) AA.RequireRMB=v end, "Only activates the aimbot while the right mouse button is held down.")
 mkToggle(AimbotP,"Wall Check (line of sight)", AA.WallCheck, function(v) AA.WallCheck=v end, "Skips targets that are blocked by walls or other geometry.")
 mkToggle(AimbotP,"Show FOV", AA.ShowFOV, function(v) AA.ShowFOV=v end, "Displays the aiming field-of-view circle on your screen.")
