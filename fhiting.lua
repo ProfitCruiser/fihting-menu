@@ -16,6 +16,12 @@ local TextService       = game:GetService("TextService")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera      = workspace.CurrentCamera
+local Mouse do
+    local ok, value = pcall(function()
+        return LocalPlayer:GetMouse()
+    end)
+    Mouse = ok and value or nil
+end
 
 -- forward-declare Root so click handlers can access it before it's created
 local Root
@@ -723,6 +729,7 @@ local AA={
     Strength=0.15,
     PartName="Head",
     ShowFOV=false,
+    SilentAim=false,
     FOVRadiusPx=180,
     MaxDistance=250,
     MinDistance=0,
@@ -741,6 +748,68 @@ local AA={
     ReactionJitter=0,
     VerticalOffset=0,
 }
+
+local SilentAimState = {
+    point = nil,
+    part = nil,
+}
+
+local unpack = table.unpack or unpack
+
+if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" and typeof(checkcaller) == "function" and Mouse then
+    local oldIndex
+    oldIndex = hookmetamethod(game, "__index", function(self, key)
+        if not checkcaller() and AA.SilentAim and SilentAimState.point then
+            if self == Mouse then
+                if key == "Hit" then
+                    local originCF = Mouse.Origin or Camera.CFrame
+                    return CFrame.new(originCF.Position, SilentAimState.point)
+                elseif key == "Target" then
+                    return SilentAimState.part or oldIndex(self, key)
+                end
+            end
+        end
+        return oldIndex(self, key)
+    end)
+
+    local oldNamecall
+    oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+        local method = getnamecallmethod()
+        local args = {...}
+        if not checkcaller() and AA.SilentAim and SilentAimState.point then
+            if method == "Raycast" and self == workspace then
+                local origin, direction = args[1], args[2]
+                if typeof(origin) == "Vector3" and typeof(direction) == "Vector3" then
+                    local newDir = SilentAimState.point - origin
+                    if newDir.Magnitude > 0 then
+                        local magnitude = direction.Magnitude
+                        if magnitude > 0 then
+                            args[2] = newDir.Unit * magnitude
+                        else
+                            args[2] = newDir
+                        end
+                        return oldNamecall(self, unpack(args))
+                    end
+                end
+            elseif method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" or method == "FindPartOnRay" then
+                local ray = args[1]
+                if typeof(ray) == "Ray" then
+                    local origin = ray.Origin
+                    local desired = SilentAimState.point - origin
+                    local magnitude = ray.Direction.Magnitude
+                    if desired.Magnitude > 0 then
+                        if magnitude <= 0 then
+                            magnitude = desired.Magnitude
+                        end
+                        args[1] = Ray.new(origin, desired.Unit * magnitude)
+                        return oldNamecall(self, unpack(args))
+                    end
+                end
+            end
+        end
+        return oldNamecall(self, ...)
+    end)
+end
 local ESP={
     Enabled=false,
     EnemiesOnly=false,
@@ -770,6 +839,178 @@ local Cross={
     Pulse=false,
     PulseSpeed=2.5,
 }
+
+local function newWeakPartSet()
+    return setmetatable({}, {__mode = "k"})
+end
+
+local NoClipState = {
+    enabled = false,
+    connection = nil,
+    characterConn = nil,
+    changed = newWeakPartSet(),
+}
+
+local function disablePartCollision(part)
+    if part and part:IsA("BasePart") and part.CanCollide then
+        NoClipState.changed[part] = true
+        part.CanCollide = false
+    end
+end
+
+local function enforceNoClip()
+    local character = LocalPlayer.Character
+    if not character then return end
+    for _, descendant in ipairs(character:GetDescendants()) do
+        disablePartCollision(descendant)
+    end
+end
+
+local function setNoClipEnabled(enabled)
+    enabled = enabled == true
+    if enabled == NoClipState.enabled then
+        return
+    end
+
+    NoClipState.enabled = enabled
+
+    if enabled then
+        NoClipState.changed = newWeakPartSet()
+        enforceNoClip()
+
+        if NoClipState.connection then
+            NoClipState.connection:Disconnect()
+        end
+        NoClipState.connection = RunService.Stepped:Connect(enforceNoClip)
+
+        if NoClipState.characterConn then
+            NoClipState.characterConn:Disconnect()
+        end
+        NoClipState.characterConn = LocalPlayer.CharacterAdded:Connect(function()
+            NoClipState.changed = newWeakPartSet()
+            task.defer(enforceNoClip)
+        end)
+    else
+        if NoClipState.connection then
+            NoClipState.connection:Disconnect()
+            NoClipState.connection = nil
+        end
+        if NoClipState.characterConn then
+            NoClipState.characterConn:Disconnect()
+            NoClipState.characterConn = nil
+        end
+
+        for part in pairs(NoClipState.changed) do
+            if part and part.Parent and part:IsA("BasePart") then
+                part.CanCollide = true
+            end
+        end
+        NoClipState.changed = newWeakPartSet()
+    end
+end
+
+-- movement overrides (walk speed, jump power, infinite jump)
+local Movement = {
+    WalkSpeedOverride = false,
+    WalkSpeed = 22,
+    JumpPowerOverride = false,
+    JumpPower = 70,
+    InfiniteJump = false,
+}
+
+local MovementRuntime = {
+    humanoid = nil,
+    defaults = nil,
+    enforceConn = nil,
+}
+
+local function getLocalHumanoid()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    return char:FindFirstChildOfClass("Humanoid")
+end
+
+local function cacheMovementDefaults(humanoid)
+    if not humanoid then
+        MovementRuntime.humanoid = nil
+        MovementRuntime.defaults = nil
+        return
+    end
+
+    if MovementRuntime.humanoid ~= humanoid then
+        MovementRuntime.humanoid = humanoid
+        MovementRuntime.defaults = {
+            WalkSpeed = humanoid.WalkSpeed,
+            JumpPower = humanoid.JumpPower,
+            JumpHeight = humanoid.JumpHeight,
+            UseJumpPower = humanoid.UseJumpPower,
+        }
+    end
+end
+
+local function enforceMovement()
+    local hum = getLocalHumanoid()
+    if not hum then return end
+
+    cacheMovementDefaults(hum)
+
+    if Movement.WalkSpeedOverride then
+        hum.WalkSpeed = Movement.WalkSpeed
+    elseif MovementRuntime.defaults and MovementRuntime.defaults.WalkSpeed then
+        hum.WalkSpeed = MovementRuntime.defaults.WalkSpeed
+    end
+
+    if Movement.JumpPowerOverride then
+        if hum.UseJumpPower ~= nil then
+            hum.UseJumpPower = true
+        end
+        hum.JumpPower = Movement.JumpPower
+    elseif MovementRuntime.defaults then
+        local defaults = MovementRuntime.defaults
+        if defaults.UseJumpPower ~= nil and hum.UseJumpPower ~= defaults.UseJumpPower then
+            hum.UseJumpPower = defaults.UseJumpPower
+        end
+        if defaults.JumpPower ~= nil then
+            hum.JumpPower = defaults.JumpPower
+        end
+        if defaults.JumpHeight ~= nil then
+            hum.JumpHeight = defaults.JumpHeight
+        end
+    end
+end
+
+local function updateMovementLoop()
+    local shouldRun = Movement.WalkSpeedOverride or Movement.JumpPowerOverride
+
+    if shouldRun then
+        if not MovementRuntime.enforceConn then
+            MovementRuntime.enforceConn = RunService.Stepped:Connect(enforceMovement)
+        end
+        enforceMovement()
+    else
+        if MovementRuntime.enforceConn then
+            MovementRuntime.enforceConn:Disconnect()
+            MovementRuntime.enforceConn = nil
+        end
+        enforceMovement()
+    end
+end
+
+LocalPlayer.CharacterAdded:Connect(function()
+    MovementRuntime.humanoid = nil
+    MovementRuntime.defaults = nil
+    task.delay(0.25, updateMovementLoop)
+end)
+
+task.defer(updateMovementLoop)
+
+UserInputService.JumpRequest:Connect(function()
+    if not Movement.InfiniteJump then return end
+    local hum = getLocalHumanoid()
+    if hum then
+        hum:ChangeState(Enum.HumanoidStateType.Jumping)
+    end
+end)
 
 --==================== RUNTIME / DRAW ====================--
 -- FOV ring
@@ -934,11 +1175,15 @@ end
 
 -- Main render
 RunService.RenderStepped:Connect(function(dt)
+    SilentAimState.point = nil
+    SilentAimState.part = nil
+
     local fovRadius = math.max(0, AA.FOVRadiusPx or 0)
-    FOV.Visible = (AA.Enabled and AA.ShowFOV)
+    local aimFeatureEnabled = (AA.Enabled or AA.SilentAim)
+    FOV.Visible = (aimFeatureEnabled and AA.ShowFOV)
     FOV.Size    = UDim2.fromOffset(fovRadius*2, fovRadius*2)
 
-    local aiming = AA.Enabled and (not AA.RequireRMB or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2))
+    local aiming = aimFeatureEnabled and (not AA.RequireRMB or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2))
     if aiming then
         local candidate = getTarget()
         if AA.StickyAim then
@@ -998,15 +1243,22 @@ RunService.RenderStepped:Connect(function(dt)
                     alpha = math.clamp(alpha + normalized * AA.CloseRangeBoost, 0, 1)
                 end
 
-                local deadzone = math.max(0, AA.Deadzone or 0)
-                if deadzone > 0 then
-                    local closeness = (targetInfo.pixelDist - deadzone) / math.max(deadzone, 1)
-                    if closeness > 0 then
-                        local scale = math.clamp(closeness, 0.05, 1)
-                        Camera.CFrame = Camera.CFrame:Lerp(des, math.clamp(alpha * scale, 0, 1))
+                if AA.SilentAim then
+                    SilentAimState.point = targetPos
+                    SilentAimState.part = validateTarget(targetInfo) and targetInfo.part or nil
+                end
+
+                if AA.Enabled then
+                    local deadzone = math.max(0, AA.Deadzone or 0)
+                    if deadzone > 0 then
+                        local closeness = (targetInfo.pixelDist - deadzone) / math.max(deadzone, 1)
+                        if closeness > 0 then
+                            local scale = math.clamp(closeness, 0.05, 1)
+                            Camera.CFrame = Camera.CFrame:Lerp(des, math.clamp(alpha * scale, 0, 1))
+                        end
+                    else
+                        Camera.CFrame = Camera.CFrame:Lerp(des, alpha)
                     end
-                else
-                    Camera.CFrame = Camera.CFrame:Lerp(des, alpha)
                 end
             end
         else
@@ -1070,11 +1322,12 @@ RunService.RenderStepped:Connect(function() for _,pl in ipairs(Players:GetPlayer
 Players.PlayerAdded:Connect(function(p) p.CharacterAdded:Connect(function() task.wait(0.2); espTick(p) end) end)
 
 --==================== PAGES & CONTROLS ====================--
-local AimbotP = newPage("Aimbot")
-local ESPP    = newPage("ESP")
-local VisualP = newPage("Visuals")
-local MiscP   = newPage("Misc")
-local ConfP   = newPage("Config")
+local AimbotP   = newPage("Aimbot")
+local ESPP      = newPage("ESP")
+local VisualP   = newPage("Visuals")
+local MovementP = newPage("Movement")
+local MiscP     = newPage("Misc")
+local ConfP     = newPage("Config")
 
 local ESPColorPresets = {
     {label = "Crimson Pulse", value = Color3.fromRGB(255, 70, 70)},
@@ -1091,6 +1344,7 @@ local ESPColorPresets = {
 tabButton("Aimbot", AimbotP)
 tabButton("ESP", ESPP)
 tabButton("Visuals", VisualP)
+tabButton("Movement", MovementP)
 tabButton("Misc", MiscP)
 tabButton("Config", ConfP)
 -- make Aimbot page visible by default
@@ -1098,6 +1352,7 @@ AimbotP.Visible = true
 
 -- Aimbot block
 mkToggle(AimbotP,"Enable Aimbot", AA.Enabled, function(v) AA.Enabled=v end, "Turns the aimbot feature on or off.")
+mkToggle(AimbotP,"Silent Aim (no camera move)", AA.SilentAim, function(v) AA.SilentAim=v end, "Adjusts hit-scan rays to your target without shifting the camera.")
 mkToggle(AimbotP,"Require Right Mouse (hold)", AA.RequireRMB, function(v) AA.RequireRMB=v end, "Only activates the aimbot while the right mouse button is held down.")
 mkToggle(AimbotP,"Wall Check (line of sight)", AA.WallCheck, function(v) AA.WallCheck=v end, "Skips targets that are blocked by walls or other geometry.")
 mkToggle(AimbotP,"Show FOV", AA.ShowFOV, function(v) AA.ShowFOV=v end, "Displays the aiming field-of-view circle on your screen.")
@@ -1192,6 +1447,39 @@ RunService.RenderStepped:Connect(function()
     if rainbowSpeed then setInteractable(rainbowSpeed.Row, Cross.Rainbow) end
     if pulseSpeed then setInteractable(pulseSpeed.Row, Cross.Pulse) end
 end)
+
+-- Movement
+local walkSpeedToggle, walkSpeedSlider
+walkSpeedToggle = mkToggle(MovementP,"WalkSpeed Override", Movement.WalkSpeedOverride, function(v)
+    Movement.WalkSpeedOverride = v
+    if walkSpeedSlider then setInteractable(walkSpeedSlider.Row, v) end
+    updateMovementLoop()
+end, "Forces your humanoid to move at the selected walk speed.")
+walkSpeedSlider = mkSlider(MovementP,"WalkSpeed", 6, 120, Movement.WalkSpeed, function(x)
+    Movement.WalkSpeed = math.floor(x + 0.5)
+    if Movement.WalkSpeedOverride then updateMovementLoop() end
+end,"stud/s", "Sets the walk speed used when the override is enabled.")
+setInteractable(walkSpeedSlider.Row, Movement.WalkSpeedOverride)
+
+local jumpPowerToggle, jumpPowerSlider
+jumpPowerToggle = mkToggle(MovementP,"Jump Power Override", Movement.JumpPowerOverride, function(v)
+    Movement.JumpPowerOverride = v
+    if jumpPowerSlider then setInteractable(jumpPowerSlider.Row, v) end
+    updateMovementLoop()
+end, "Locks your jump strength to the chosen value regardless of in-game changes.")
+jumpPowerSlider = mkSlider(MovementP,"Jump Power", 20, 150, Movement.JumpPower, function(x)
+    Movement.JumpPower = math.floor(x + 0.5)
+    if Movement.JumpPowerOverride then updateMovementLoop() end
+end,nil, "Controls the jump power applied when the override is active.")
+setInteractable(jumpPowerSlider.Row, Movement.JumpPowerOverride)
+
+local infiniteJumpToggle = mkToggle(MovementP,"Infinite Jump", Movement.InfiniteJump, function(v)
+    Movement.InfiniteJump = v
+end, "Lets you trigger another jump even while already airborne.")
+
+local noclipToggle = mkToggle(MovementP,"NoClip", NoClipState.enabled, function(v)
+    setNoClipEnabled(v)
+end, "Disables collisions on your character so you can move through geometry.")
 
 -- Misc
 mkToggle(MiscP,"Press K to toggle UI", true, function() end, "Reminder that you can press K to hide or show the panel.")
@@ -1305,6 +1593,27 @@ local function killMenu()
     -- disable features so runtime loops render nothing
     AA.Enabled=false; ESP.Enabled=false; Cross.Enabled=false; updCross()
     stickyTarget=nil; stickyTimer=0
+    if noclipToggle then
+        noclipToggle.Set(false)
+    else
+        setNoClipEnabled(false)
+    end
+    if walkSpeedToggle then
+        walkSpeedToggle.Set(false)
+    else
+        Movement.WalkSpeedOverride = false
+    end
+    if jumpPowerToggle then
+        jumpPowerToggle.Set(false)
+    else
+        Movement.JumpPowerOverride = false
+    end
+    if infiniteJumpToggle then
+        infiniteJumpToggle.Set(false)
+    else
+        Movement.InfiniteJump = false
+    end
+    updateMovementLoop()
     -- clean existing highlights
     for _,pl in ipairs(Players:GetPlayers()) do
         local ch = pl.Character
@@ -1326,13 +1635,15 @@ local BASE="ProfitCruiser"; local PROF=BASE.."/Profiles"; local MODE="memory"; l
 local function ensure() if makefolder then local ok1=true if not (isfolder and isfolder(BASE)) then ok1=pcall(function() makefolder(BASE) end) end local ok2=true if not (isfolder and isfolder(PROF)) then ok2=pcall(function() makefolder(PROF) end) end return ok1 and ok2 end return false end
 if ensure() and writefile and readfile then MODE="filesystem" end
 local function deep(dst,src) for k,v in pairs(src) do if typeof(v)=="table" and typeof(dst[k])=="table" then deep(dst[k],v) else dst[k]=v end end end
-local function gather() return {AA=AA, ESP=ESP, Cross=Cross} end
+local function gather() return {AA=AA, ESP=ESP, Cross=Cross, Movement=Movement} end
 local function apply(s)
     if not s then return end
     deep(AA,s.AA or {})
     deep(ESP,s.ESP or {})
     deep(Cross,s.Cross or {})
+    deep(Movement,s.Movement or {})
     updCross()
+    updateMovementLoop()
 end
 local function save(name) local ok,data=pcall(function() return HttpService:JSONEncode(gather()) end); if not ok then return false,"encode" end if MODE=="filesystem" then local p=PROF.."/"..name..".json"; local s,err=pcall(function() writefile(p,data) end); return s,(s and nil or tostring(err)) else MEM[name]=data; return true end end
 local function load(name) if MODE=="filesystem" then local p=PROF.."/"..name..".json"; if not (isfile and isfile(p)) then return false,"missing" end local ok,raw=pcall(function() return readfile(p) end); if not ok then return false,"read" end local ok2,tbl=pcall(function() return HttpService:JSONDecode(raw) end); if not ok2 then return false,"decode" end apply(tbl); return true else local raw=MEM[name]; if not raw then return false,"missing" end local ok2,tbl=pcall(function() return HttpService:JSONDecode(raw) end); if not ok2 then return false,"decode" end apply(tbl); return true end end
