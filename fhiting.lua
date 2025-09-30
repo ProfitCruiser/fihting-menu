@@ -1097,7 +1097,7 @@ local function autoFarmStep(currentThread)
                     err or "unknown error"))
             else
                 AutoFarm.CustomerOrders[customer] = order
-                AutoFarm.ActiveOrderCount += 1
+                AutoFarm.ActiveOrderCount = AutoFarm.ActiveOrderCount + 1
                 setFarmStatus(string.format("Order placed for %s.", customer.Name or customer:GetFullName()))
 
                 task.spawn(function()
@@ -1753,7 +1753,7 @@ end)
 local defaultSubText = creditSub.Text
 local copySignal = 0
 discordBtn.MouseButton1Click:Connect(function()
-    copySignal += 1
+    copySignal = copySignal + 1
     local ticket = copySignal
     local success = false
     if setclipboard then
