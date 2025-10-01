@@ -8,6 +8,7 @@
 local TweenService      = game:GetService("TweenService")
 local UserInputService  = game:GetService("UserInputService")
 local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Lighting          = game:GetService("Lighting")
 local Players           = game:GetService("Players")
 local GuiService        = game:GetService("GuiService")
@@ -771,6 +772,440 @@ local Cross={
     PulseSpeed=2.5,
 }
 
+--==================== RESTAURANT AUTO FARM ====================--
+local AutoFarm = {
+    Enabled = false,
+    ScanInterval = 1,
+    MaxOrders = 8,
+    Remotes = nil,
+    Modules = {},
+    CustomerOrders = {},
+    ActiveOrderCount = 0,
+    Thread = nil,
+    Status = "AutoFarm idle. Toggle to begin.",
+    LastIdleStatus = 0,
+    LastMenu = nil,
+    FoodConsumedConnection = nil,
+    ToggleControl = nil,
+    Syncing = false,
+}
+
+local AutoFarmStatusLabel
+
+local function setFarmStatus(text)
+    local msg = trim(text or "")
+    if msg == "" then
+        msg = "AutoFarm idle."
+    end
+    if AutoFarm.Status ~= msg then
+        AutoFarm.Status = msg
+        if AutoFarmStatusLabel then
+            AutoFarmStatusLabel.Text = msg
+        end
+        print("[Aurora][AutoFarm] " .. msg)
+    end
+end
+
+local function callRemote(remote, ...)
+    if not remote or not remote.IsA then
+        return false, "missing remote"
+    end
+    if remote:IsA("RemoteFunction") then
+        local ok, res = pcall(function()
+            return remote:InvokeServer(...)
+        end)
+        return ok, res
+    end
+    if remote:IsA("RemoteEvent") then
+        local ok, err = pcall(function()
+            remote:FireServer(...)
+        end)
+        return ok, err
+    end
+    return false, "unsupported remote type"
+end
+
+local function fetchRestaurantRemotes()
+    local events = ReplicatedStorage:FindFirstChild("Events")
+    if not events then
+        return nil, "ReplicatedStorage.Events folder not found"
+    end
+
+    local restaurantFolder = events:FindFirstChild("Restaurant")
+    local foodFolder = events:FindFirstChild("Food")
+    local cookFolder = events:FindFirstChild("Cook")
+
+    if not restaurantFolder or not foodFolder then
+        return nil, "Restaurant or Food remote folders missing"
+    end
+
+    local remotes = {
+        GetMenu = restaurantFolder:FindFirstChild("FoodMenu") and restaurantFolder.FoodMenu:FindFirstChild("GetMenu"),
+        FoodOrdered = foodFolder:FindFirstChild("FoodOrdered"),
+        GrabFood = restaurantFolder:FindFirstChild("GrabFood"),
+        CookInputRequested = cookFolder and cookFolder:FindFirstChild("CookInputRequested") or nil,
+        CookUpdated = cookFolder and cookFolder:FindFirstChild("CookUpdated") or nil,
+        FoodConsumed = foodFolder:FindFirstChild("FoodConsumed"),
+        PurchaseIngredientRequested = foodFolder:FindFirstChild("PurchaseIngredientRequested"),
+    }
+
+    if not remotes.GetMenu or not remotes.FoodOrdered then
+        return nil, "Required Restaurant Tycoon 3 remotes are missing"
+    end
+
+    return remotes
+end
+
+local function loadRestaurantModules()
+    local modules = {}
+    local source = ReplicatedStorage:FindFirstChild("Source")
+    if not source then
+        return modules
+    end
+
+    local util = source:FindFirstChild("Utility")
+    if not util then
+        return modules
+    end
+
+    local function tryLoad(childName, key)
+        local module = util:FindFirstChild(childName)
+        if module and module:IsA("ModuleScript") then
+            local ok, lib = pcall(require, module)
+            if ok then
+                modules[key] = lib
+            end
+        end
+    end
+
+    tryLoad("Food", "FoodUtility")
+    tryLoad("Cook", "CookUtility")
+    tryLoad("Furniture", "FurnitureUtility")
+
+    return modules
+end
+
+local function getCustomerFolder()
+    local source = ReplicatedStorage:FindFirstChild("Source")
+    if not source then return nil end
+    local data = source:FindFirstChild("Data")
+    if not data then return nil end
+    local restaurant = data:FindFirstChild("Restaurant")
+    if not restaurant then return nil end
+    return restaurant:FindFirstChild("CustomerList") or restaurant:FindFirstChild("Customers")
+end
+
+local function scanForWaitingCustomers()
+    local customers = {}
+    local folder = getCustomerFolder()
+    if not folder then
+        return customers
+    end
+
+    for _, customer in ipairs(folder:GetChildren()) do
+        local isWaiting = false
+        local stateValue = customer:FindFirstChild("State")
+        if stateValue and stateValue:IsA("StringValue") then
+            isWaiting = stateValue.Value == "Waiting"
+        end
+        local waitingValue = customer:FindFirstChild("Waiting")
+        if waitingValue and waitingValue:IsA("BoolValue") then
+            isWaiting = waitingValue.Value or isWaiting
+        end
+        if isWaiting then
+            table.insert(customers, customer)
+        end
+    end
+
+    return customers
+end
+
+local function getMenu()
+    if not AutoFarm.Remotes or not AutoFarm.Remotes.GetMenu then
+        return nil, "GetMenu remote missing"
+    end
+
+    local now = os.clock()
+    if AutoFarm.LastMenu and (now - (AutoFarm.LastMenu.timestamp or 0)) < 5 then
+        return AutoFarm.LastMenu.data
+    end
+
+    local success, menu = callRemote(AutoFarm.Remotes.GetMenu)
+    if not success then
+        return nil, tostring(menu)
+    end
+    if type(menu) == "table" then
+        AutoFarm.LastMenu = {data = menu, timestamp = now}
+    end
+    return menu
+end
+
+local function selectDish(menu)
+    if type(menu) ~= "table" then
+        return nil
+    end
+    if menu[1] ~= nil then
+        return menu[1]
+    end
+    for _, item in pairs(menu) do
+        return item
+    end
+    return nil
+end
+
+local function orderForCustomer(customer)
+    local menu, err = getMenu()
+    if not menu then
+        return false, nil, err
+    end
+
+    local dish = selectDish(menu)
+    if not dish then
+        return false, nil, "No dishes available"
+    end
+
+    local ok, orderErr = callRemote(AutoFarm.Remotes.FoodOrdered, customer, dish)
+    if not ok then
+        return false, nil, tostring(orderErr)
+    end
+
+    return true, {
+        id = HttpService:GenerateGUID(false),
+        customer = customer,
+        dish = dish,
+        orderedAt = os.time(),
+    }
+end
+
+local function processCooking(order)
+    if not AutoFarm.Enabled then
+        return
+    end
+
+    local cookUtil = AutoFarm.Modules.CookUtility
+    if cookUtil then
+        if cookUtil.StartCook then
+            pcall(cookUtil.StartCook, order)
+        end
+        if cookUtil.FinishCook then
+            pcall(cookUtil.FinishCook, order)
+            return
+        end
+    end
+
+    local remotes = AutoFarm.Remotes
+    if remotes then
+        if remotes.CookInputRequested then
+            callRemote(remotes.CookInputRequested, order.customer, {complete = true, dish = order.dish})
+        end
+        if remotes.CookUpdated then
+            callRemote(remotes.CookUpdated, order.customer, {status = "Completed", dish = order.dish})
+        end
+    end
+end
+
+local function pickupAndServe(order)
+    if not AutoFarm.Enabled then
+        return
+    end
+
+    local remotes = AutoFarm.Remotes
+    if remotes and remotes.GrabFood then
+        callRemote(remotes.GrabFood, order.customer, order.dish)
+    end
+
+    local furnitureUtil = AutoFarm.Modules.FurnitureUtility
+    if furnitureUtil and furnitureUtil.PlaceFoodOnTable then
+        pcall(furnitureUtil.PlaceFoodOnTable, order)
+    end
+
+    local foodUtil = AutoFarm.Modules.FoodUtility
+    if foodUtil and foodUtil.ServeCustomer then
+        pcall(foodUtil.ServeCustomer, order.customer, order.dish)
+    end
+end
+
+local function clearFoodConsumedConnection()
+    if AutoFarm.FoodConsumedConnection then
+        AutoFarm.FoodConsumedConnection:Disconnect()
+        AutoFarm.FoodConsumedConnection = nil
+    end
+end
+
+local function bindFoodConsumed()
+    clearFoodConsumedConnection()
+    local remote = AutoFarm.Remotes and AutoFarm.Remotes.FoodConsumed
+    if remote and remote:IsA("RemoteEvent") then
+        AutoFarm.FoodConsumedConnection = remote.OnClientEvent:Connect(function()
+            if AutoFarm.Enabled then
+                setFarmStatus("Guests finished eating. Awaiting new customers…")
+            end
+        end)
+    end
+end
+
+local function releaseOrder(customer)
+    if AutoFarm.CustomerOrders[customer] then
+        AutoFarm.CustomerOrders[customer] = nil
+        AutoFarm.ActiveOrderCount = math.max(0, AutoFarm.ActiveOrderCount - 1)
+    end
+end
+
+local function autoFarmStep(currentThread)
+    if not AutoFarm.Enabled or AutoFarm.Thread ~= currentThread then
+        return
+    end
+
+    if not AutoFarm.Remotes then
+        local remotes, err = fetchRestaurantRemotes()
+        if not remotes then
+            setFarmStatus("Waiting for Restaurant remotes: " .. (err or "unknown error"))
+            task.wait(3)
+            return
+        end
+        AutoFarm.Remotes = remotes
+        bindFoodConsumed()
+        setFarmStatus("Restaurant remotes located. Waiting for customers…")
+    end
+
+    local waitingCustomers = scanForWaitingCustomers()
+    if #waitingCustomers == 0 then
+        local now = os.clock()
+        if now - (AutoFarm.LastIdleStatus or 0) > 5 then
+            setFarmStatus("Idle – no waiting customers.")
+            AutoFarm.LastIdleStatus = now
+        end
+        return
+    end
+
+    for _, customer in ipairs(waitingCustomers) do
+        if not AutoFarm.Enabled or AutoFarm.Thread ~= currentThread then
+            return
+        end
+
+        if AutoFarm.CustomerOrders[customer] then
+            -- already handling this customer
+        else
+            if AutoFarm.ActiveOrderCount >= AutoFarm.MaxOrders then
+                break
+            end
+
+            local ok, order, err = orderForCustomer(customer)
+            if not ok or not order then
+                setFarmStatus(string.format("Failed to order for %s: %s",
+                    customer.Name or customer:GetFullName(),
+                    err or "unknown error"))
+            else
+                AutoFarm.CustomerOrders[customer] = order
+                AutoFarm.ActiveOrderCount = AutoFarm.ActiveOrderCount + 1
+                setFarmStatus(string.format("Order placed for %s.", customer.Name or customer:GetFullName()))
+
+                task.spawn(function()
+                    processCooking(order)
+                    if AutoFarm.Enabled then
+                        pickupAndServe(order)
+                        if AutoFarm.Enabled then
+                            setFarmStatus(string.format("Served %s.", customer.Name or customer:GetFullName()))
+                        end
+                    end
+                    releaseOrder(customer)
+                end)
+            end
+        end
+    end
+end
+
+local function autoFarmLoop()
+    local thread = coroutine.running()
+    AutoFarm.Thread = thread
+    while AutoFarm.Enabled and AutoFarm.Thread == thread do
+        autoFarmStep(thread)
+        local interval = math.max(0.2, AutoFarm.ScanInterval or 1)
+        task.wait(interval)
+    end
+    if AutoFarm.Thread == thread then
+        AutoFarm.Thread = nil
+    end
+end
+
+local function syncToggleState()
+    local control = AutoFarm.ToggleControl
+    if not control or not control.Get or not control.Set then
+        return
+    end
+    local desired = AutoFarm.Enabled
+    if control.Get() ~= desired then
+        AutoFarm.Syncing = true
+        control.Set(desired)
+        AutoFarm.Syncing = false
+    end
+end
+
+local function startAutoFarm()
+    if AutoFarm.Thread then
+        return
+    end
+    task.spawn(autoFarmLoop)
+end
+
+local function stopAutoFarm()
+    AutoFarm.Enabled = false
+    AutoFarm.Remotes = nil
+    AutoFarm.Modules = {}
+    AutoFarm.CustomerOrders = {}
+    AutoFarm.ActiveOrderCount = 0
+    AutoFarm.LastMenu = nil
+    clearFoodConsumedConnection()
+end
+
+local function autofarm(state)
+    if state == nil then
+        state = not AutoFarm.Enabled
+    end
+
+    if state then
+        if AutoFarm.Enabled then
+            syncToggleState()
+            return true, "AutoFarm already enabled"
+        end
+
+        local remotes, err = fetchRestaurantRemotes()
+        if not remotes then
+            setFarmStatus("Cannot start AutoFarm: " .. (err or "missing remotes"))
+            syncToggleState()
+            return false, err or "missing remotes"
+        end
+
+        AutoFarm.Remotes = remotes
+        AutoFarm.Modules = loadRestaurantModules()
+        AutoFarm.CustomerOrders = {}
+        AutoFarm.ActiveOrderCount = 0
+        AutoFarm.LastMenu = nil
+        AutoFarm.Enabled = true
+        bindFoodConsumed()
+        setFarmStatus("AutoFarm enabled. Waiting for customers…")
+        startAutoFarm()
+        syncToggleState()
+        return true, "AutoFarm enabled"
+    end
+
+    stopAutoFarm()
+    setFarmStatus("AutoFarm disabled.")
+    syncToggleState()
+    return true, "AutoFarm disabled"
+end
+
+do
+    local ok, env = pcall(function()
+        return getgenv and getgenv()
+    end)
+    if ok and type(env) == "table" then
+        env.autofarm = autofarm
+    else
+        _G.autofarm = autofarm
+    end
+end
+
 --==================== RUNTIME / DRAW ====================--
 -- FOV ring
 local AA_GUI=Instance.new("ScreenGui"); AA_GUI.Name="PC_FOV"; AA_GUI.IgnoreGuiInset=true; AA_GUI.ResetOnSpawn=false; AA_GUI.DisplayOrder=45; AA_GUI.Parent=safeParent()
@@ -1070,226 +1505,24 @@ RunService.RenderStepped:Connect(function() for _,pl in ipairs(Players:GetPlayer
 Players.PlayerAdded:Connect(function(p) p.CharacterAdded:Connect(function() task.wait(0.2); espTick(p) end) end)
 
 --==================== PAGES & CONTROLS ====================--
-local AimbotP = newPage("Aimbot")
-local ESPP    = newPage("ESP")
-local VisualP = newPage("Visuals")
-local MiscP   = newPage("Misc")
-local ConfP   = newPage("Config")
-
-local ESPColorPresets = {
-    {label = "Crimson Pulse", value = Color3.fromRGB(255, 70, 70)},
-    {label = "Solar Gold", value = Color3.fromRGB(255, 255, 0)},
-    {label = "Toxic Lime", value = Color3.fromRGB(0, 255, 140)},
-    {label = "Electric Azure", value = Color3.fromRGB(90, 190, 255)},
-    {label = "Aurora Cyan", value = Color3.fromRGB(70, 255, 255)},
-    {label = "Royal Violet", value = Color3.fromRGB(180, 110, 255)},
-    {label = "Sunburst", value = Color3.fromRGB(255, 170, 60)},
-    {label = "Frostbite", value = Color3.fromRGB(210, 235, 255)},
-}
+local AimbotP     = newPage("Aimbot")
+local ESPP        = newPage("ESP")
+local VisualP     = newPage("Visuals")
+local RestaurantP = newPage("Restaurant")
+local MiscP       = newPage("Misc")
+local ConfP       = newPage("Config")
 
 -- create tabs (avoid firing signals programmatically)
 tabButton("Aimbot", AimbotP)
 tabButton("ESP", ESPP)
 tabButton("Visuals", VisualP)
+tabButton("Restaurant", RestaurantP)
 tabButton("Misc", MiscP)
 tabButton("Config", ConfP)
 -- make Aimbot page visible by default
 AimbotP.Visible = true
 
--- Aimbot block
-mkToggle(AimbotP,"Enable Aimbot", AA.Enabled, function(v) AA.Enabled=v end, "Turns the aimbot feature on or off.")
-mkToggle(AimbotP,"Require Right Mouse (hold)", AA.RequireRMB, function(v) AA.RequireRMB=v end, "Only activates the aimbot while the right mouse button is held down.")
-mkToggle(AimbotP,"Wall Check (line of sight)", AA.WallCheck, function(v) AA.WallCheck=v end, "Skips targets that are blocked by walls or other geometry.")
-mkToggle(AimbotP,"Show FOV", AA.ShowFOV, function(v) AA.ShowFOV=v end, "Displays the aiming field-of-view circle on your screen.")
-mkSlider(AimbotP,"FOV Radius", 40, 500, AA.FOVRadiusPx, function(x) AA.FOVRadiusPx=math.floor(x) end,"px", "Sets the radius of the aim assist field-of-view circle in pixels.")
-mkSlider(AimbotP,"Deadzone Padding", 0, 20, AA.Deadzone, function(x) AA.Deadzone=x end,"px", "Defines an inner deadzone where the aimbot will not move the camera.")
-mkSlider(AimbotP,"Strength (lower=stronger)", 0.05, 0.40, AA.Strength, function(x) AA.Strength=x end,nil, "Controls how strongly the camera lerps toward the target (lower means snappier).")
-mkSlider(AimbotP,"Max Distance", 50, 1000, AA.MaxDistance, function(x) AA.MaxDistance=math.floor(x) end,"studs", "Limits aiming to targets within this distance.")
-mkSlider(AimbotP,"Min Distance Gate", 0, 250, AA.MinDistance, function(x) AA.MinDistance=math.floor(x) end,"studs", "Ignores targets that are closer than this distance.")
-local targetPriority = mkCycle(AimbotP,"Target Priority", {
-    {label="Hybrid (angle+distance)", value="Hybrid"},
-    {label="Closest Angle", value="Angle"},
-    {label="Closest Distance", value="Distance"},
-    {label="Lowest Health", value="Health"},
-}, AA.TargetSort, function(val) AA.TargetSort=val end, "Chooses how potential targets are ranked before aiming.")
-local distanceWeight = mkSlider(AimbotP,"Hybrid Distance Weight", 0, 0.08, AA.DistanceWeight, function(x) AA.DistanceWeight=x end,nil, "Adjusts how much distance influences the hybrid priority mode.")
-local dynamicPartToggle
-dynamicPartToggle = mkToggle(AimbotP,"Auto Bone Selection", AA.DynamicPart, function(v) AA.DynamicPart=v end, "Automatically chooses which body part to aim at based on target movement.")
-local partCycle = mkCycle(AimbotP,"Manual Target Bone", {"Head","UpperTorso","HumanoidRootPart"}, AA.PartName, function(val) AA.PartName=val end, "Selects the specific body part to aim at when auto selection is disabled.")
-local stickyToggle = mkToggle(AimbotP,"Sticky Aim (keep last target)", AA.StickyAim, function(v)
-    AA.StickyAim=v
-    if not v then stickyTarget=nil; stickyTimer=0 end
-end, "Keeps following the most recent target for a short period even if they leave the FOV.")
-local stickyDuration = mkSlider(AimbotP,"Sticky Duration", 0.1, 1.5, AA.StickTime, function(x)
-    AA.StickTime=x
-    stickyTimer = math.min(stickyTimer, AA.StickTime)
-end,"s", "How long sticky aim should hold onto the previous target.")
-local reactionDelay = mkSlider(AimbotP,"Reaction Delay", 0, 0.35, AA.ReactionDelay, function(x) AA.ReactionDelay=x end,"s", "Adds a delay before the aimbot begins to adjust toward a target.")
-local reactionJitter = mkSlider(AimbotP,"Reaction Jitter", 0, 0.3, AA.ReactionJitter, function(x) AA.ReactionJitter=x end,"s", "Adds random variation to the reaction delay for a more human feel.")
-local adaptiveToggle = mkToggle(AimbotP,"Adaptive Smoothing Boost", AA.AdaptiveSmoothing, function(v) AA.AdaptiveSmoothing=v end, "Boosts smoothing strength as enemies move closer to you.")
-local closeBoost = mkSlider(AimbotP,"Close-range Boost", 0, 0.6, AA.CloseRangeBoost, function(x) AA.CloseRangeBoost=x end,nil, "Amount of extra smoothing applied when targets are nearby.")
-local predictionSlider = mkSlider(AimbotP,"Lead Prediction", 0, 0.75, AA.Prediction, function(x) AA.Prediction=x end,"s", "Predicts where moving targets will be after this many seconds.")
-local heightOffset = mkSlider(AimbotP,"Aim Height Offset", -2, 2, AA.VerticalOffset, function(x) AA.VerticalOffset=x end,"studs", "Shifts the aim point up or down relative to the target.")
-
-setInteractable(stickyDuration.Row, AA.StickyAim)
-setInteractable(closeBoost.Row, AA.AdaptiveSmoothing)
-if partCycle and partCycle.Row then setInteractable(partCycle.Row, not AA.DynamicPart) end
-if reactionJitter and reactionJitter.Row then setInteractable(reactionJitter.Row, (AA.ReactionDelay or 0) > 0) end
-if distanceWeight and distanceWeight.Row then setInteractable(distanceWeight.Row, (AA.TargetSort or "Hybrid") == "Hybrid") end
-RunService.RenderStepped:Connect(function()
-    setInteractable(stickyDuration.Row, AA.StickyAim)
-    setInteractable(closeBoost.Row, AA.AdaptiveSmoothing)
-    if partCycle and partCycle.Row then setInteractable(partCycle.Row, not AA.DynamicPart) end
-    if reactionJitter and reactionJitter.Row then setInteractable(reactionJitter.Row, (AA.ReactionDelay or 0) > 0) end
-    if distanceWeight and distanceWeight.Row then setInteractable(distanceWeight.Row, (AA.TargetSort or "Hybrid") == "Hybrid") end
-end)
-
--- ESP
-mkToggle(ESPP,"Enable ESP", ESP.Enabled, function(v) ESP.Enabled=v end, "Turns highlight ESP visuals on or off.")
-mkToggle(ESPP,"Enemies Only", ESP.EnemiesOnly, function(v) ESP.EnemiesOnly=v end, "Only shows ESP highlights on enemy players.")
-mkToggle(ESPP,"Use Distance Limit", ESP.UseDistance, function(v) ESP.UseDistance=v end, "Restricts ESP to players within the max distance slider.")
-mkSlider(ESPP,"Max Distance", 50, 2000, ESP.MaxDistance, function(x) ESP.MaxDistance=math.floor(x) end,"studs", "Sets the farthest distance that ESP highlights will appear.")
-mkToggle(ESPP,"Render Through Walls", ESP.ThroughWalls, function(v) ESP.ThroughWalls=v end, "Forces highlight outlines to show even through walls.")
-mkSlider(ESPP,"Fill Transparency", 0, 1, ESP.FillTransparency, function(x) ESP.FillTransparency=x end,nil, "Adjusts how solid the ESP highlight fill appears.")
-mkSlider(ESPP,"Outline Transparency", 0, 1, ESP.OutlineTransparency, function(x) ESP.OutlineTransparency=x end,nil, "Adjusts how visible the ESP outline is.")
-mkSlider(ESPP,"Color Intensity", 0.4, 1.6, ESP.ColorIntensity, function(x) ESP.ColorIntensity=x end,nil, "Boosts or softens highlight brightness for every player type.")
-mkCycle(ESPP, "Enemy Highlight", ESPColorPresets, ESP.EnemyColor, function(col) ESP.EnemyColor = col end, "Choose the glow color used when enemies are highlighted.")
-mkCycle(ESPP, "Friendly Highlight", ESPColorPresets, ESP.FriendColor, function(col) ESP.FriendColor = col end, "Select the highlight tint for teammates and allies.")
-mkCycle(ESPP, "Neutral Highlight", ESPColorPresets, ESP.NeutralColor, function(col) ESP.NeutralColor = col end, "Pick the tone shown for players with no team alignment.")
-
--- Visuals
-local crossT = mkToggle(VisualP,"Crosshair", Cross.Enabled, function(v) Cross.Enabled=v; updCross() end, "Shows or hides the custom crosshair overlay.")
-mkSlider(VisualP,"Opacity", 0.1,1, Cross.Opacity, function(x) Cross.Opacity=x; updCross() end,nil, "Sets how transparent the crosshair appears.")
-mkSlider(VisualP,"Size", 4,24, Cross.Size, function(x) Cross.Size=math.floor(x); updCross() end,nil, "Controls the overall length of the crosshair lines.")
-mkSlider(VisualP,"Gap", 2,20, Cross.Gap, function(x) Cross.Gap=math.floor(x); updCross() end,nil, "Adjusts the gap between the crosshair arms and the center.")
-mkSlider(VisualP,"Thickness", 1,6, Cross.Thickness, function(x) Cross.Thickness=math.floor(x); updCross() end,nil, "Changes how thick each crosshair arm is.")
-local dotT = mkToggle(VisualP,"Center Dot", Cross.CenterDot, function(v) Cross.CenterDot=v; updCross() end, "Adds a dot to the middle of the crosshair.")
-local dotS = mkSlider(VisualP,"Dot Size", 1,6, Cross.DotSize, function(x) Cross.DotSize=math.floor(x); updCross() end,nil, "Sets the size of the center dot.")
-local dotO = mkSlider(VisualP,"Dot Opacity", 0.1,1, Cross.DotOpacity, function(x) Cross.DotOpacity=x; updCross() end,nil, "Controls the transparency of the center dot.")
-local teamColorToggle
-local rainbowToggle
-teamColorToggle = mkToggle(VisualP,"Use Team Color", Cross.UseTeamColor, function(v)
-    Cross.UseTeamColor=v
-    if v and rainbowToggle then
-        Cross.Rainbow=false
-        rainbowToggle.Set(false)
-    end
-    updCross()
-end, "Applies your current team color to the crosshair.")
-rainbowToggle = mkToggle(VisualP,"Rainbow Cycle", Cross.Rainbow, function(v)
-    Cross.Rainbow=v
-    if v and teamColorToggle then
-        Cross.UseTeamColor=false
-        teamColorToggle.Set(false)
-    end
-    updCross()
-end, "Cycles crosshair colors through a rainbow gradient.")
-local rainbowSpeed = mkSlider(VisualP,"Rainbow Speed", 0.2, 3, Cross.RainbowSpeed, function(x) Cross.RainbowSpeed=x; updCross() end,nil, "Controls how quickly the rainbow effect animates.")
-local pulseToggle = mkToggle(VisualP,"Pulse Opacity", Cross.Pulse, function(v) Cross.Pulse=v; updCross() end, "Makes the crosshair fade in and out repeatedly.")
-local pulseSpeed = mkSlider(VisualP,"Pulse Speed", 0.5, 5, Cross.PulseSpeed, function(x) Cross.PulseSpeed=x; updCross() end,nil, "Sets the speed of the crosshair opacity pulse.")
-RunService.RenderStepped:Connect(function()
-    local on=Cross.CenterDot; setInteractable(dotS.Row,on); setInteractable(dotO.Row,on)
-    if rainbowSpeed then setInteractable(rainbowSpeed.Row, Cross.Rainbow) end
-    if pulseSpeed then setInteractable(pulseSpeed.Row, Cross.Pulse) end
-end)
-
--- Misc
-mkToggle(MiscP,"Press K to toggle UI", true, function() end, "Reminder that you can press K to hide or show the panel.")
-local dragToggle = mkToggle(MiscP,"Allow Dragging", true, function(v)
-    draggingEnabled = v
-    if not v then dragging=false end
-end, "Enables dragging the window around the screen.")
-local centerBtn = mkButton(MiscP, "Center Panel", function()
-    Root.Position = UDim2.fromScale(0.5,0.5)
-    dragging = false
-end, {buttonText="Center"}, "Recenters the panel on your screen.")
-local scaleSlider = mkSlider(MiscP,"UI Scale", 0.85, 1.25, PanelScale.Scale, function(x) PanelScale.Scale=x end,"x", "Changes the overall size of the menu UI.")
-
-local creditCard = Instance.new("Frame", MiscP)
-creditCard.Name = "CreditsCard"
-creditCard.BackgroundColor3 = T.Card
-creditCard.Size = UDim2.new(0.5, -6, 0, 64)
-corner(creditCard, 10)
-stroke(creditCard, T.Stroke, 1, 0.25)
-
-local creditPadding = Instance.new("UIPadding", creditCard)
-creditPadding.PaddingLeft = UDim.new(0, 18)
-creditPadding.PaddingRight = UDim.new(0, 18)
-creditPadding.PaddingTop = UDim.new(0, 12)
-creditPadding.PaddingBottom = UDim.new(0, 12)
-
-local creditTitle = Instance.new("TextLabel", creditCard)
-creditTitle.BackgroundTransparency = 1
-creditTitle.Position = UDim2.new(0, 0, 0, 0)
-creditTitle.Size = UDim2.new(1, -140, 0, 22)
-creditTitle.Font = Enum.Font.GothamBold
-creditTitle.Text = "Made by ProfitCruiser"
-creditTitle.TextColor3 = T.Text
-creditTitle.TextSize = 15
-creditTitle.TextXAlignment = Enum.TextXAlignment.Left
-creditTitle.TextYAlignment = Enum.TextYAlignment.Top
-
-local creditSub = Instance.new("TextLabel", creditCard)
-creditSub.BackgroundTransparency = 1
-creditSub.Position = UDim2.new(0, 0, 0, 24)
-creditSub.Size = UDim2.new(1, -140, 1, -28)
-creditSub.Font = Enum.Font.Gotham
-creditSub.Text = "Made by ProfitCruiser"
-creditSub.TextColor3 = T.Subtle
-creditSub.TextSize = 12
-creditSub.TextWrapped = true
-creditSub.TextXAlignment = Enum.TextXAlignment.Left
-creditSub.TextYAlignment = Enum.TextYAlignment.Top
-
-local discordBtn = Instance.new("TextButton", creditCard)
-discordBtn.Name = "DiscordCopy"
-discordBtn.AutoButtonColor = false
-discordBtn.Size = UDim2.new(0, 120, 0, 34)
-discordBtn.Position = UDim2.new(1, -132, 0.5, -17)
-discordBtn.Font = Enum.Font.GothamBold
-discordBtn.Text = "Discord"
-discordBtn.TextColor3 = T.Text
-discordBtn.TextSize = 14
-discordBtn.BackgroundColor3 = T.Accent
-corner(discordBtn, 12)
-stroke(discordBtn, T.Stroke, 1, 0.3)
-
-local discordHover = T.Neon
-local discordBase = discordBtn.BackgroundColor3
-discordBtn.MouseEnter:Connect(function()
-    TweenService:Create(discordBtn, TweenInfo.new(0.12), {BackgroundColor3 = discordHover}):Play()
-end)
-discordBtn.MouseLeave:Connect(function()
-    TweenService:Create(discordBtn, TweenInfo.new(0.12), {BackgroundColor3 = discordBase}):Play()
-end)
-
-local defaultSubText = creditSub.Text
-local copySignal = 0
-discordBtn.MouseButton1Click:Connect(function()
-    copySignal += 1
-    local ticket = copySignal
-    local success = false
-    if setclipboard then
-        success = pcall(function()
-            setclipboard(DISCORD_URL)
-        end)
-        success = success == true
-    end
-    if success then
-        creditSub.Text = "Discord Link Copyed"
-        creditSub.TextColor3 = T.Good
-    else
-        creditSub.Text = "Kunne ikke kopiere automatisk — bruk lenken: " .. DISCORD_URL
-        creditSub.TextColor3 = T.Warn
-    end
-    TweenService:Create(creditSub, TweenInfo.new(0.12), {TextTransparency = 0}):Play()
-    task.delay(1.6, function()
-        if copySignal == ticket then
-            creditSub.Text = defaultSubText
-            creditSub.TextColor3 = T.Subtle
-        end
-    end)
-end)
+-- Menu content intentionally removed.
 
 -- Kill Menu logic
 local function killMenu()
@@ -1317,28 +1550,6 @@ UserInputService.InputBegan:Connect(function(i)
     if i.KeyCode==Enum.KeyCode.K then Root.Visible = not Root.Visible end
     if i.KeyCode==Enum.KeyCode.P then killMenu() end
 end)
-
--- Button to kill menu
-mkButton(MiscP, "Kill Menu (remove UI)", function() killMenu() end, {danger=true, buttonText="Kill Menu"}, "Completely closes the UI and disables every feature until re-executed.")
-
--- Config / profiles
-local BASE="ProfitCruiser"; local PROF=BASE.."/Profiles"; local MODE="memory"; local MEM=rawget(_G,"PC_ProfileStore") or {}; _G.PC_ProfileStore=MEM
-local function ensure() if makefolder then local ok1=true if not (isfolder and isfolder(BASE)) then ok1=pcall(function() makefolder(BASE) end) end local ok2=true if not (isfolder and isfolder(PROF)) then ok2=pcall(function() makefolder(PROF) end) end return ok1 and ok2 end return false end
-if ensure() and writefile and readfile then MODE="filesystem" end
-local function deep(dst,src) for k,v in pairs(src) do if typeof(v)=="table" and typeof(dst[k])=="table" then deep(dst[k],v) else dst[k]=v end end end
-local function gather() return {AA=AA, ESP=ESP, Cross=Cross} end
-local function apply(s)
-    if not s then return end
-    deep(AA,s.AA or {})
-    deep(ESP,s.ESP or {})
-    deep(Cross,s.Cross or {})
-    updCross()
-end
-local function save(name) local ok,data=pcall(function() return HttpService:JSONEncode(gather()) end); if not ok then return false,"encode" end if MODE=="filesystem" then local p=PROF.."/"..name..".json"; local s,err=pcall(function() writefile(p,data) end); return s,(s and nil or tostring(err)) else MEM[name]=data; return true end end
-local function load(name) if MODE=="filesystem" then local p=PROF.."/"..name..".json"; if not (isfile and isfile(p)) then return false,"missing" end local ok,raw=pcall(function() return readfile(p) end); if not ok then return false,"read" end local ok2,tbl=pcall(function() return HttpService:JSONDecode(raw) end); if not ok2 then return false,"decode" end apply(tbl); return true else local raw=MEM[name]; if not raw then return false,"missing" end local ok2,tbl=pcall(function() return HttpService:JSONDecode(raw) end); if not ok2 then return false,"decode" end apply(tbl); return true end end
-
-local saveBtn = mkToggle(ConfP,"Save Default (click)", false, function(v,row) if v then local ok,err=save("Default"); (row:FindFirstChildWhichIsA("TextLabel")).Text = ok and "Saved Default ✅" or ("Save failed: "..tostring(err)); task.delay(0.4,function() (row:FindFirstChildWhichIsA("TextLabel")).Text="Save Default (click)" end) end end, "Saves your current settings into the Default profile slot.")
-local loadBtn = mkToggle(ConfP,"Load Default (click)", false, function(v,row) if v then local ok,err=load("Default"); (row:FindFirstChildWhichIsA("TextLabel")).Text = ok and "Loaded Default ✅" or ("Load failed: "..tostring(err)); task.delay(0.4,function() (row:FindFirstChildWhichIsA("TextLabel")).Text="Load Default (click)" end) end end, "Loads the Default profile back into all features.")
 
 -- Show panel when gate closes (only if allowed by flow)
 Gate:GetPropertyChangedSignal("Enabled"):Connect(function()
